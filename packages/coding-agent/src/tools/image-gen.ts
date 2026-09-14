@@ -1963,8 +1963,13 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				);
 			}
 
+			const errors: Error[] = failures.map(failure => failure.error);
+			// A recorded MiniMax edit limit stays actionable once any later
+			// provider also failed — otherwise the aggregate would list only
+			// the downstream failure and hide why MiniMax was skipped.
+			if (editLimit) errors.push(new Error(`${editLimit.provider}: ${editLimit.message}`));
 			throw new AggregateError(
-				failures.map(failure => failure.error),
+				errors,
 				`Image generation failed for all credentialed providers: ${failures.map(failure => failure.provider).join(", ")}`,
 			);
 		});

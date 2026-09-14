@@ -1320,4 +1320,73 @@ describe("imageGenTool", () => {
 		expect(result.details?.provider).toBe("gemini");
 		expect(result.details?.imageCount).toBe(1);
 	});
+	it("keeps the MiniMax edit limit visible when a later provider also fails", async () => {
+		setImageProviderOrder(["minimax", "gemini"]);
+
+		const fetchMock = (async (input: string | URL | Request) => {
+			const url = input.toString();
+			if (url.includes("generativelanguage.googleapis.com")) {
+				return new Response("boom", { status: 500 });
+			}
+			throw new Error(`Unexpected provider request: ${url}`);
+		}) as unknown as typeof fetch;
+
+		const ctx: CustomToolContext = {
+			fetch: fetchMock,
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: {
+				getApiKey: async () => undefined,
+				getApiKeyForProvider: async (provider: string) => {
+					if (provider === "minimax-code") return "test-minimax-key";
+					if (provider === "google") return "test-gemini-token";
+					return undefined;
+				},
+				getProviderBaseUrl: () => undefined,
+				getAll: () => [],
+				authStorage: {
+					hasNonEnvCredential: () => false,
+					rotateSessionCredential: async () => false,
+				},
+				resolver: (provider: string) => async () =>
+					provider === "minimax-code" ? "test-minimax-key" : "test-gemini-token",
+			} as unknown as ModelRegistry,
+			model: undefined,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		const error: unknown = await imageGenTool
+			.execute(
+				"call-minimax-limit-aggregate",
+				{
+					subject: "the cat",
+					changes: ["make it noir"],
+					input: [
+						{ data: Buffer.from("a").toString("base64"), mime_type: "image/png" },
+						{ data: Buffer.from("b").toString("base64"), mime_type: "image/png" },
+					],
+				},
+				undefined,
+				ctx,
+			)
+			.then(
+				() => null,
+				err => err,
+			);
+
+		// The Gemini failure must not bury why MiniMax skipped the request.
+		expect(error).toBeInstanceOf(AggregateError);
+		const aggregate = error as AggregateError;
+		expect(aggregate.message).toContain("gemini");
+		expect(
+			aggregate.errors.some(
+				cause =>
+					cause instanceof Error && cause.message.includes("MiniMax image edits accept a single reference image"),
+			),
+		).toBe(true);
+	});
 });
