@@ -46,6 +46,10 @@ const DEFAULT_ANTIGRAVITY_MODEL = "gemini-3-pro-image";
 const DEFAULT_XAI_IMAGE_MODEL = "grok-imagine-image";
 const DEFAULT_DEEPINFRA_IMAGE_MODEL = "black-forest-labs/FLUX-2-pro";
 const DEEPINFRA_IMAGES_URL = "https://api.deepinfra.com/v1/openai/images/generations";
+const DEFAULT_MINIMAX_IMAGE_MODEL = "image-01";
+const MINIMAX_GLOBAL_IMAGE_URL = "https://api.minimax.io/v1/image_generation";
+const MINIMAX_CHINA_IMAGE_URL = "https://api.minimax.cn/v1/image_generation";
+const MINIMAX_MAX_REFERENCE_BYTES = 10 * 1024 * 1024; // documented i2i limit (JPG/PNG)
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -63,6 +67,8 @@ export type ImageProviderPreference = ImageProvider | "auto";
 interface ImageApiKey {
 	provider: ImageProvider;
 	apiKey: ApiKey;
+	/** Provider-specific full endpoint URL (MiniMax region). */
+	baseUrl?: string;
 	projectId?: string;
 	model?: Model;
 }
@@ -522,6 +528,77 @@ async function collectImageEndpointImages(
 	return inlineImages;
 }
 
+interface MinimaxBaseResp {
+	status_code?: number;
+	status_msg?: string;
+}
+
+interface MinimaxImageResponse {
+	data?: { image_urls?: string[]; image_base64?: string[] };
+	base_resp?: MinimaxBaseResp;
+}
+
+/**
+ * MiniMax reports application errors with HTTP 200 and a non-zero
+ * `base_resp.status_code`. Translating to ProviderHttpError is load-bearing:
+ * only that class lets the execute loop fall through to the next provider.
+ */
+function minimaxBaseRespError(baseResp: MinimaxBaseResp): ProviderHttpError {
+	const statusCode = baseResp.status_code ?? 0;
+	const status =
+		statusCode === 1002 ? 429 : statusCode === 1004 || statusCode === 2049 ? 401 : statusCode === 1008 ? 402 : 502;
+	return new ProviderHttpError(
+		`MiniMax image request failed (status_code ${statusCode}): ${baseResp.status_msg ?? "unknown error"}`,
+		status,
+	);
+}
+
+function buildMinimaxRequestBody(
+	prompt: string,
+	aspectRatio: string | undefined,
+	imageSize: string | undefined,
+	reference: InlineImageData | undefined,
+) {
+	return {
+		model: DEFAULT_MINIMAX_IMAGE_MODEL,
+		prompt,
+		aspect_ratio: aspectRatio ?? "1:1",
+		response_format: "base64" as const,
+		n: 1,
+		// Explicit pixel dimensions only when the caller gave an image_size
+		// without an aspect ratio (MiniMax lets aspect_ratio win server-side).
+		...(aspectRatio === undefined && imageSize
+			? { width: Number(imageSize.split("x")[0]), height: Number(imageSize.split("x")[1]) }
+			: {}),
+		// MiniMax i2i accepts exactly one character reference image.
+		...(reference ? { subject_reference: [{ type: "character" as const, image_file: toDataUrl(reference) }] } : {}),
+	};
+}
+
+async function parseMinimaxImageResponse(
+	rawText: string,
+	fetchImpl: FetchImpl,
+	signal: AbortSignal | undefined,
+): Promise<InlineImageData[]> {
+	const parsed = JSON.parse(rawText) as MinimaxImageResponse;
+	const baseResp = parsed.base_resp;
+	if (baseResp && typeof baseResp.status_code === "number" && baseResp.status_code !== 0) {
+		throw minimaxBaseRespError(baseResp);
+	}
+	const inlineImages: InlineImageData[] = [];
+	for (const entry of parsed.data?.image_base64 ?? []) {
+		const bytes = Buffer.from(entry, "base64");
+		const mimeType = parseImageMetadata(bytes)?.mimeType ?? "image/jpeg";
+		inlineImages.push({ data: entry, mimeType });
+	}
+	if (inlineImages.length === 0) {
+		for (const imageUrl of parsed.data?.image_urls ?? []) {
+			inlineImages.push(await loadImageFromUrl(imageUrl, fetchImpl, signal));
+		}
+	}
+	return inlineImages;
+}
+
 /** Standard tool result for an image-endpoint provider (no accompanying response text). */
 async function buildImageEndpointResult(
 	provider: ImageProvider,
@@ -565,11 +642,11 @@ export function setImageProviderOrder(providers: readonly string[]): void {
 	configuredImageProviderOrder = providers.filter(isImageProviderId);
 }
 function assertImageAspectRatioSupported(provider: ImageProvider, aspectRatio: ImageGenParams["aspect_ratio"]): void {
-	if (!aspectRatio || provider === "xai" || COMMON_IMAGE_ASPECT_RATIO_SET.has(aspectRatio)) {
+	if (!aspectRatio || provider === "xai" || provider === "minimax" || COMMON_IMAGE_ASPECT_RATIO_SET.has(aspectRatio)) {
 		return;
 	}
 	throw new Error(
-		`Aspect ratio ${aspectRatio} is only supported by xAI image generation. Set providers.image to xai or use one of ${COMMON_IMAGE_ASPECT_RATIOS.join(", ")}.`,
+		`Aspect ratio ${aspectRatio} is only supported by xAI or MiniMax image generation. Set providers.image to xai or minimax, or use one of ${COMMON_IMAGE_ASPECT_RATIOS.join(", ")}.`,
 	);
 }
 
@@ -647,6 +724,35 @@ async function findDeepInfraImageCredentials(
 	}
 	const apiKey = getEnvApiKey("deepinfra");
 	if (apiKey) return { provider: "deepinfra", apiKey };
+	return null;
+}
+
+async function findMinimaxImageCredentials(
+	modelRegistry?: ModelRegistry,
+	sessionId?: string,
+): Promise<ImageApiKey | null> {
+	// Token Plan keys are valid on the image endpoint; region follows the
+	// credential origin (intl → api.minimax.io, China → api.minimax.cn).
+	if (modelRegistry) {
+		// AuthStorage.getApiKey already falls back to env keys, so this covers
+		// MINIMAX_API_KEY, MINIMAX_CODE_API_KEY, and MINIMAX_CODE_CN_API_KEY too.
+		for (const id of ["minimax-code", "minimax-code-cn", "minimax"] as const) {
+			const apiKey = await modelRegistry.getApiKeyForProvider(id, sessionId);
+			if (!apiKey) continue;
+			return {
+				provider: "minimax",
+				apiKey: modelRegistry.resolver(id, { sessionId }),
+				baseUrl: id === "minimax-code-cn" ? MINIMAX_CHINA_IMAGE_URL : MINIMAX_GLOBAL_IMAGE_URL,
+			};
+		}
+		return null;
+	}
+	const codeKey = getEnvApiKey("minimax-code");
+	if (codeKey) return { provider: "minimax", apiKey: codeKey, baseUrl: MINIMAX_GLOBAL_IMAGE_URL };
+	const codeCnKey = getEnvApiKey("minimax-code-cn");
+	if (codeCnKey) return { provider: "minimax", apiKey: codeCnKey, baseUrl: MINIMAX_CHINA_IMAGE_URL };
+	const payAsYouGoKey = getEnvApiKey("minimax");
+	if (payAsYouGoKey) return { provider: "minimax", apiKey: payAsYouGoKey, baseUrl: MINIMAX_GLOBAL_IMAGE_URL };
 	return null;
 }
 
@@ -737,6 +843,10 @@ function activeImageProvider(model: Model | undefined): Exclude<ImageProviderPre
 			return "openrouter";
 		case "deepinfra":
 			return "deepinfra";
+		case "minimax":
+		case "minimax-code":
+		case "minimax-code-cn":
+			return "minimax";
 		case "google":
 			return "gemini";
 		default:
@@ -781,6 +891,8 @@ async function findImageApiKey(
 			return findOpenRouterImageCredentials(modelRegistry, sessionId);
 		case "deepinfra":
 			return findDeepInfraImageCredentials(modelRegistry, sessionId);
+		case "minimax":
+			return findMinimaxImageCredentials(modelRegistry, sessionId);
 		case "gemini":
 			return findGeminiImageCredentials(modelRegistry, sessionId);
 	}
@@ -1270,11 +1382,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 										? DEFAULT_XAI_IMAGE_MODEL
 										: provider === "deepinfra"
 											? DEFAULT_DEEPINFRA_IMAGE_MODEL
-											: DEFAULT_MODEL;
+											: provider === "minimax"
+												? DEFAULT_MINIMAX_IMAGE_MODEL
+												: DEFAULT_MODEL;
 					const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 					if (
 						params.aspect_ratio &&
 						provider !== "xai" &&
+						provider !== "minimax" &&
 						!COMMON_IMAGE_ASPECT_RATIO_SET.has(params.aspect_ratio)
 					) {
 						unsupportedAspectRatioProvider ??= provider;
@@ -1645,6 +1760,60 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 						return buildImageEndpointResult(provider, resolvedModel, inlineImages);
 					}
 
+					if (provider === "minimax") {
+						// MiniMax i2i accepts exactly one character reference image; a
+						// plain throw aborts the loop — wrong provider for this edit,
+						// not a transient provider failure.
+						if (resolvedImages.length > 1) {
+							throw new Error(
+								`MiniMax image edits accept a single reference image; got ${resolvedImages.length}.`,
+							);
+						}
+						const reference = resolvedImages[0];
+						if (reference && (reference.data.length * 3) / 4 > MINIMAX_MAX_REFERENCE_BYTES) {
+							throw new Error("MiniMax reference image must be under 10 MB (JPG/PNG).");
+						}
+
+						const prompt = assemblePrompt(params);
+						const requestBody = buildMinimaxRequestBody(
+							prompt,
+							params.aspect_ratio,
+							params.image_size,
+							reference,
+						);
+
+						// MiniMax reports application errors with HTTP 200 and a
+						// non-zero base_resp.status_code, so the shared OpenAI-envelope
+						// helper does not apply; parse handles the envelope below.
+						const rawText = await withAuth(
+							apiKey.apiKey,
+							async key => {
+								const resp = await fetchImpl(apiKey.baseUrl ?? MINIMAX_GLOBAL_IMAGE_URL, {
+									method: "POST",
+									headers: {
+										"Content-Type": "application/json",
+										Authorization: `Bearer ${key}`,
+									},
+									body: JSON.stringify(requestBody),
+									signal: requestSignal,
+								});
+								const text = await resp.text();
+								if (!resp.ok) {
+									throw new ProviderHttpError(
+										`MiniMax image request failed (${resp.status}): ${text}`,
+										resp.status,
+										{ headers: resp.headers },
+									);
+								}
+								return text;
+							},
+							{ signal: requestSignal },
+						);
+
+						const inlineImages = await parseMinimaxImageResponse(rawText, fetchImpl, requestSignal);
+						return buildImageEndpointResult(provider, resolvedModel, inlineImages);
+					}
+
 					const parts = [] as Array<{ text?: string; inlineData?: InlineImageData }>;
 					for (const image of resolvedImages) {
 						parts.push({ inlineData: image });
@@ -1756,7 +1925,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 			if (!foundCredentials) {
 				throw new Error(
-					"No image API credentials found. Connect a Codex (ChatGPT) subscription, use a GPT Responses/Codex model with OpenAI credentials, log in with google-antigravity or xAI Grok OAuth, or set OPENAI_API_KEY, XAI_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or DEEPINFRA_API_KEY.",
+					"No image API credentials found. Connect a Codex (ChatGPT) subscription, use a GPT Responses/Codex model with OpenAI credentials, log in with google-antigravity or xAI Grok OAuth, or set OPENAI_API_KEY, XAI_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, DEEPINFRA_API_KEY, MINIMAX_API_KEY, MINIMAX_CODE_API_KEY, or MINIMAX_CODE_CN_API_KEY.",
 				);
 			}
 
