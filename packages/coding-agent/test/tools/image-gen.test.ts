@@ -1200,4 +1200,54 @@ describe("imageGenTool", () => {
 		).rejects.toThrow("MiniMax image edits accept a single reference image; got 2.");
 		expect(requestUrls).toEqual([]);
 	});
+	it("maps image_size to explicit dimensions and omits aspect_ratio", async () => {
+		setImageProviderOrder(["minimax"]);
+		let requestBody: Record<string, unknown> | undefined;
+
+		const fetchMock: typeof fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return new Response(
+				JSON.stringify({
+					data: { image_base64: [Buffer.from("fake-jpeg").toString("base64")] },
+					base_resp: { status_code: 0, status_msg: "" },
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const ctx: CustomToolContext = {
+			fetch: fetchMock,
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: {
+				getApiKeyForProvider: async (provider: string) =>
+					provider === "minimax-code" ? "test-minimax-key" : undefined,
+				getProviderBaseUrl: () => undefined,
+				getAll: () => [],
+				authStorage: { rotateSessionCredential: async () => false },
+				resolver: () => async () => "test-minimax-key",
+			} as unknown as ModelRegistry,
+			model: undefined,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		const result = await imageGenTool.execute(
+			"call-minimax-size",
+			{ subject: "a cat", image_size: "1536x1024" },
+			undefined,
+			ctx,
+		);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		// aspect_ratio wins server-side, so an explicit image_size must not
+		// ship a default aspect ratio alongside the pixel dimensions.
+		expect(requestBody?.width).toBe(1536);
+		expect(requestBody?.height).toBe(1024);
+		expect(requestBody).not.toHaveProperty("aspect_ratio");
+		expect(result.details?.imageCount).toBe(1);
+	});
 });

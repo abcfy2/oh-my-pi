@@ -562,14 +562,17 @@ function buildMinimaxRequestBody(
 	return {
 		model: DEFAULT_MINIMAX_IMAGE_MODEL,
 		prompt,
-		aspect_ratio: aspectRatio ?? "1:1",
 		response_format: "base64" as const,
 		n: 1,
-		// Explicit pixel dimensions only when the caller gave an image_size
-		// without an aspect ratio (MiniMax lets aspect_ratio win server-side).
+		// aspect_ratio wins server-side over width/height, so it is only sent
+		// when explicit pixel dimensions are absent; an image_size without an
+		// aspect_ratio maps to width/height directly.
 		...(aspectRatio === undefined && imageSize
-			? { width: Number(imageSize.split("x")[0]), height: Number(imageSize.split("x")[1]) }
-			: {}),
+			? {
+					width: Number(imageSize.split("x")[0]),
+					height: Number(imageSize.split("x")[1]),
+				}
+			: { aspect_ratio: aspectRatio ?? "1:1" }),
 		// MiniMax i2i accepts exactly one character reference image.
 		...(reference ? { subject_reference: [{ type: "character" as const, image_file: toDataUrl(reference) }] } : {}),
 	};
