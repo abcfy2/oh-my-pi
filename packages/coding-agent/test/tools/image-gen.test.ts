@@ -1174,7 +1174,10 @@ describe("imageGenTool", () => {
 					provider === "minimax-code" ? "test-minimax-key" : undefined,
 				getProviderBaseUrl: () => undefined,
 				getAll: () => [],
-				authStorage: { rotateSessionCredential: async () => false },
+				authStorage: {
+					hasNonEnvCredential: () => false,
+					rotateSessionCredential: async () => false,
+				},
 				resolver: () => async () => "test-minimax-key",
 			} as unknown as ModelRegistry,
 			model: undefined,
@@ -1248,6 +1251,73 @@ describe("imageGenTool", () => {
 		expect(requestBody?.width).toBe(1536);
 		expect(requestBody?.height).toBe(1024);
 		expect(requestBody).not.toHaveProperty("aspect_ratio");
+		expect(result.details?.imageCount).toBe(1);
+	});
+	it("continues past MiniMax to an edit-capable provider for multi-image edits", async () => {
+		setImageProviderOrder(["minimax", "gemini"]);
+		const requestUrls: string[] = [];
+		const geminiImage = Buffer.from("gemini-noir-edit").toString("base64");
+
+		const fetchMock = (async (input: string | URL | Request) => {
+			const url = input.toString();
+			requestUrls.push(url);
+			if (url.includes("generativelanguage.googleapis.com")) {
+				return new Response(
+					JSON.stringify({
+						candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: geminiImage } }] } }],
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected provider request: ${url}`);
+		}) as unknown as typeof fetch;
+
+		const ctx: CustomToolContext = {
+			fetch: fetchMock,
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: {
+				getApiKey: async () => undefined,
+				getApiKeyForProvider: async (provider: string) => {
+					if (provider === "minimax-code") return "test-minimax-key";
+					if (provider === "google") return "test-gemini-token";
+					return undefined;
+				},
+				getProviderBaseUrl: () => undefined,
+				getAll: () => [],
+				authStorage: {
+					hasNonEnvCredential: () => false,
+					rotateSessionCredential: async () => false,
+				},
+				resolver: (provider: string) => async () =>
+					provider === "minimax-code" ? "test-minimax-key" : "test-gemini-token",
+			} as unknown as ModelRegistry,
+			model: undefined,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		const result = await imageGenTool.execute(
+			"call-minimax-multiref-fallback",
+			{
+				subject: "the cat",
+				changes: ["make it noir"],
+				input: [
+					{ data: Buffer.from("a").toString("base64"), mime_type: "image/png" },
+					{ data: Buffer.from("b").toString("base64"), mime_type: "image/png" },
+				],
+			},
+			undefined,
+			ctx,
+		);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		// MiniMax must never see a multi-reference edit; Gemini serves it instead.
+		expect(requestUrls.every(url => !url.includes("minimax"))).toBe(true);
+		expect(result.details?.provider).toBe("gemini");
 		expect(result.details?.imageCount).toBe(1);
 	});
 });

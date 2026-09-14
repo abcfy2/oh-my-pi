@@ -578,16 +578,22 @@ function buildMinimaxRequestBody(
 	};
 }
 
-async function parseMinimaxImageResponse(
-	rawText: string,
-	fetchImpl: FetchImpl,
-	signal: AbortSignal | undefined,
-): Promise<InlineImageData[]> {
+/** Validate MiniMax's envelope (HTTP 200 + base_resp.status_code) before the caller sees it. */
+function parseMinimaxEnvelope(rawText: string): MinimaxImageResponse {
 	const parsed = JSON.parse(rawText) as MinimaxImageResponse;
 	const baseResp = parsed.base_resp;
 	if (baseResp && typeof baseResp.status_code === "number" && baseResp.status_code !== 0) {
 		throw minimaxBaseRespError(baseResp);
 	}
+	return parsed;
+}
+
+/** Extract inline images from a validated envelope (base64 preferred, URL fallback). */
+async function collectMinimaxImages(
+	parsed: MinimaxImageResponse,
+	fetchImpl: FetchImpl,
+	signal: AbortSignal | undefined,
+): Promise<InlineImageData[]> {
 	const inlineImages: InlineImageData[] = [];
 	for (const entry of parsed.data?.image_base64 ?? []) {
 		const bytes = Buffer.from(entry, "base64");
@@ -1355,6 +1361,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const failures: Array<{ provider: ImageProvider; error: ProviderHttpError }> = [];
 			let unsupportedAspectRatioProvider: ImageProvider | undefined;
 			let editUnsupportedProvider: ImageProvider | undefined;
+			let editLimit: { provider: ImageProvider; message: string } | undefined;
 			let foundCredentials = false;
 			let resolvedImageCache: InlineImageData[] | undefined;
 
@@ -1762,19 +1769,25 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 						const inlineImages = await collectImageEndpointImages(rawText, fetchImpl, requestSignal);
 						return buildImageEndpointResult(provider, resolvedModel, inlineImages);
 					}
-
 					if (provider === "minimax") {
-						// MiniMax i2i accepts exactly one character reference image; a
-						// plain throw aborts the loop — wrong provider for this edit,
-						// not a transient provider failure.
+						// MiniMax i2i accepts exactly one character reference
+						// image under 10 MB (JPG/PNG). Defer to later
+						// edit-capable providers first; surface the limit only
+						// if none of them can serve the request.
 						if (resolvedImages.length > 1) {
-							throw new Error(
-								`MiniMax image edits accept a single reference image; got ${resolvedImages.length}.`,
-							);
+							editLimit ??= {
+								provider,
+								message: `MiniMax image edits accept a single reference image; got ${resolvedImages.length}.`,
+							};
+							continue;
 						}
 						const reference = resolvedImages[0];
 						if (reference && (reference.data.length * 3) / 4 > MINIMAX_MAX_REFERENCE_BYTES) {
-							throw new Error("MiniMax reference image must be under 10 MB (JPG/PNG).");
+							editLimit ??= {
+								provider,
+								message: "MiniMax reference images must be under 10 MB (JPG/PNG).",
+							};
+							continue;
 						}
 
 						const prompt = assemblePrompt(params);
@@ -1784,11 +1797,13 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 							params.image_size,
 							reference,
 						);
-
 						// MiniMax reports application errors with HTTP 200 and a
-						// non-zero base_resp.status_code, so the shared OpenAI-envelope
-						// helper does not apply; parse handles the envelope below.
-						const rawText = await withAuth(
+						// non-zero base_resp.status_code, so the shared
+						// OpenAI-envelope helper does not apply. Validate inside
+						// the withAuth callback — same shape as
+						// postImageEndpointRequest — so the translated 401/429
+						// engage central refresh + sibling-credential retry.
+						const envelope = await withAuth(
 							apiKey.apiKey,
 							async key => {
 								const resp = await fetchImpl(apiKey.baseUrl ?? MINIMAX_GLOBAL_IMAGE_URL, {
@@ -1808,12 +1823,12 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 										{ headers: resp.headers },
 									);
 								}
-								return text;
+								return parseMinimaxEnvelope(text);
 							},
 							{ signal: requestSignal },
 						);
 
-						const inlineImages = await parseMinimaxImageResponse(rawText, fetchImpl, requestSignal);
+						const inlineImages = await collectMinimaxImages(envelope, fetchImpl, requestSignal);
 						return buildImageEndpointResult(provider, resolvedModel, inlineImages);
 					}
 
@@ -1939,6 +1954,12 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			if (failures.length === 0 && editUnsupportedProvider) {
 				throw new Error(
 					`${editUnsupportedProvider} image generation is text-to-image only and cannot edit input images. Configure an edit-capable provider (openai, openai-codex, antigravity, xai, openrouter, gemini) or retry without input images.`,
+				);
+			}
+
+			if (failures.length === 0 && editLimit) {
+				throw new Error(
+					`${editLimit.message} Configure an edit-capable provider (openai, openai-codex, antigravity, xai, openrouter, gemini) or retry without input images.`,
 				);
 			}
 
