@@ -1064,7 +1064,7 @@ describe("imageGenTool", () => {
 		expect(result.details?.imageCount).toBe(1);
 	});
 
-	it("routes China Token Plan credentials to api.minimax.cn", async () => {
+	it("routes China Token Plan credentials to the canonical China host", async () => {
 		setImageProviderOrder(["minimax"]);
 		let requestUrl: string | undefined;
 
@@ -1102,7 +1102,7 @@ describe("imageGenTool", () => {
 		const result = await imageGenTool.execute("call-minimax-cn", { subject: "a cat" }, undefined, ctx);
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
-		expect(requestUrl?.startsWith("https://api.minimax.cn/")).toBe(true);
+		expect(requestUrl?.startsWith("https://api.minimaxi.com/")).toBe(true);
 		expect(result.details?.provider).toBe("minimax");
 		expect(result.details?.imageCount).toBe(1);
 	});

@@ -48,7 +48,7 @@ const DEFAULT_DEEPINFRA_IMAGE_MODEL = "black-forest-labs/FLUX-2-pro";
 const DEEPINFRA_IMAGES_URL = "https://api.deepinfra.com/v1/openai/images/generations";
 const DEFAULT_MINIMAX_IMAGE_MODEL = "image-01";
 const MINIMAX_GLOBAL_IMAGE_URL = "https://api.minimax.io/v1/image_generation";
-const MINIMAX_CHINA_IMAGE_URL = "https://api.minimax.cn/v1/image_generation";
+const MINIMAX_CHINA_IMAGE_URL = "https://api.minimaxi.com/v1/image_generation";
 const MINIMAX_MAX_REFERENCE_BYTES = 10 * 1024 * 1024; // documented i2i limit (JPG/PNG)
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
@@ -741,7 +741,7 @@ async function findMinimaxImageCredentials(
 	sessionId?: string,
 ): Promise<ImageApiKey | null> {
 	// Token Plan keys are valid on the image endpoint; region follows the
-	// credential origin (intl → api.minimax.io, China → api.minimax.cn).
+	// credential origin (intl → api.minimax.io, China → api.minimaxi.com).
 	if (modelRegistry) {
 		// AuthStorage.getApiKey already falls back to env keys, so this covers
 		// MINIMAX_API_KEY, MINIMAX_CODE_API_KEY, and MINIMAX_CODE_CN_API_KEY too.
