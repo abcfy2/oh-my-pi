@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added MiniMax image generation for `generate_image` (global and China hosts, pay-as-you-go and Token Plan keys) ([#12073](https://github.com/can1357/oh-my-pi/pull/12073) by [@abcfy2](https://github.com/abcfy2)).
+
 ## [18.3.2] - 2026-09-25
 
 ### Added
