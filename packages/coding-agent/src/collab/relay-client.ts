@@ -3,9 +3,11 @@
  *
  * Connects to a relay room, seals/opens AES-GCM frames, and reconnects with
  * exponential backoff on transient drops. Guests also survive the relay's
- * host-drop room teardown while the host recreates the room; other fatal relay
- * close codes (host conflict, room full) and guest decryption failures never
- * reconnect. Hosts discard undecryptable guest frames without closing the room.
+ * host-drop room teardown while the host recreates the room, and a host whose
+ * connection dropped outlasts the relay still holding that connection; other
+ * fatal relay close codes (host conflict, room full) and guest decryption
+ * failures never reconnect. Hosts discard undecryptable guest frames without
+ * closing the room.
  */
 import { getProxyForUrl } from "@oh-my-pi/pi-ai/utils/proxy";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -22,6 +24,21 @@ const RELAY_CLOSE_REASONS: Record<number, string> = {
 
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
+/**
+ * How long after a transient drop a host keeps retrying the relay's duplicate-host
+ * close (4009). The client can see its connection end before the relay does, and
+ * the relay refuses the reconnect until its liveness check retires the old socket:
+ * the public relay took about 40 s for a connection that went silent, and Bun's
+ * default WebSocket idle timeout, which the reference relay inherits, is 120 s. A
+ * refusal after this window, or on a first connect, is a real second host.
+ */
+export const HOST_RECLAIM_WINDOW_MS = 150_000;
+/**
+ * Backoff cap for those reclaim retries. Each one is a single upgrade the relay
+ * refuses at once, so a short cap costs little and lands the reclaim within a few
+ * seconds of the relay retiring the old socket instead of up to 30 s later.
+ */
+export const HOST_RECLAIM_BACKOFF_MAX_MS = 5_000;
 const MAX_PENDING_SENDS = 256;
 const MAX_PENDING_SEND_BYTES = 16 * 1024 * 1024;
 /**
@@ -77,6 +94,14 @@ export class CollabSocket {
 	#retryMissingRoom = false;
 	/** Set while a transient drop is being retried; the next open is a new room. */
 	#rejoining = false;
+	/**
+	 * Until when a host takes the relay's duplicate-host close to be its own dropped connection.
+	 * Left set after a reclaim holds: only a reconnect can draw a 4009, and every reconnect
+	 * starts from the transient-drop path, which re-arms the window from that drop.
+	 */
+	#hostReclaimUntil: number | undefined;
+	/** Backoff for those retries: the relay completes each upgrade before refusing it, so `onopen` cannot reset it. */
+	#reclaimAttempt = 0;
 	#sending = false;
 	#sendGeneration = 0;
 	#wakeSender: (() => void) | undefined;
@@ -136,6 +161,7 @@ export class CollabSocket {
 		if (this.#ws || this.#retryTimer) return;
 		this.#closed = false;
 		this.#retryMissingRoom = false;
+		this.#hostReclaimUntil = undefined;
 		this.#attempt = 0;
 		this.#openSocket();
 	}
@@ -569,6 +595,15 @@ export class CollabSocket {
 
 	#handleClose(code: number, reason: string): void {
 		if (this.#closed) return;
+		if (code === 4009 && this.#hostReclaimUntil !== undefined && Date.now() < this.#hostReclaimUntil) {
+			logger.debug("collab: relay still holds this host's dropped connection; retrying", {
+				attempt: this.#reclaimAttempt,
+			});
+			this.#rejoining = true;
+			this.onClose?.("the relay still holds this host's previous connection", true);
+			this.#scheduleRetry(this.#reclaimAttempt++, HOST_RECLAIM_BACKOFF_MAX_MS);
+			return;
+		}
 		const fatalReason = RELAY_CLOSE_REASONS[code];
 		const closeReason = fatalReason ?? (reason || `connection lost (code ${code})`);
 		const retryRoom = this.#opts.role === "guest" && (code === 4001 || (code === 4004 && this.#retryMissingRoom));
@@ -576,7 +611,7 @@ export class CollabSocket {
 			this.#retryMissingRoom = true;
 			this.#rejoining = true;
 			this.onClose?.(closeReason, true);
-			this.#scheduleRetry();
+			this.#scheduleRetry(this.#attempt++);
 			return;
 		}
 		if (fatalReason !== undefined) {
@@ -587,8 +622,12 @@ export class CollabSocket {
 		}
 		this.#clearBackpressureDrain();
 		this.#rejoining = true;
+		if (this.#opts.role === "host") {
+			this.#hostReclaimUntil = Date.now() + HOST_RECLAIM_WINDOW_MS;
+			this.#reclaimAttempt = 0;
+		}
 		this.onClose?.(closeReason, true);
-		this.#scheduleRetry();
+		this.#scheduleRetry(this.#attempt++);
 	}
 
 	/** Decryption failure: wrong key or corrupted frame. Never reconnect. */
@@ -609,9 +648,8 @@ export class CollabSocket {
 		this.onClose?.(reason, false);
 	}
 
-	#scheduleRetry(): void {
-		const base = Math.min(BACKOFF_BASE_MS * 2 ** this.#attempt, BACKOFF_MAX_MS);
-		this.#attempt++;
+	#scheduleRetry(attempt: number, maxMs = BACKOFF_MAX_MS): void {
+		const base = Math.min(BACKOFF_BASE_MS * 2 ** attempt, maxMs);
 		const delay = base * (0.75 + Math.random() * 0.5);
 		this.#retryTimer = setTimeout(() => {
 			this.#retryTimer = undefined;
